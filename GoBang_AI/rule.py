@@ -1,6 +1,5 @@
 import numpy as np
 
-
 class game_rule:
     def __init__(self, size=15):
         self.size = size
@@ -8,16 +7,16 @@ class game_rule:
 
     def reset(self):
         self.board = np.zeros((self.size, self.size), dtype=np.int8)
-        self.current_player = 1  # Black = 1, White = 0
+        self.current_player = 1  # Black = 1, White = -1
         self.winner = None
         return self.board.copy()
 
-    def is_vaild(self, x, y):
-        return 0 <= x <= self.size and 0 <= y <= self.size and self.board[x, y] == 0
+    def is_valid(self, x, y):  # 修复拼写：vaild → valid
+        return 0 <= x < self.size and 0 <= y < self.size and self.board[x, y] == 0  # 修复边界：<= → <
 
     def step(self, action):
         x, y = action // self.size, action % self.size
-        if not self.is_vaild(x, y):
+        if not self.is_valid(x, y):
             return self.board.copy(), -10, True
 
         self.board[x, y] = self.current_player
@@ -32,7 +31,7 @@ class game_rule:
             reward = 0.0
             done = False
 
-        self.current_player *= -1
+        self.current_player *= -1  # 1 → -1 → 1 ...
         return self.board.copy(), reward, done
 
     def _check_win(self, x, y):

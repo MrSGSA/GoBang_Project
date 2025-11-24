@@ -13,16 +13,17 @@ class game_net(nn.Module):
 
         self.policy_head = nn.Conv2d(num_channels, 1, kernel_size=1)
         self.value_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(num_channels, 1), nn.Tanh()
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(num_channels, 1),
+            nn.Tanh()
         )
 
     def forward(self, x):
-        # x: [B, 1, 15, 15]
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
 
-        policy = self.policy_head(x)  # [B, 1, 15, 15]
-        policy = policy.view(-1, self.board_size * self.board_size)  # [B, 225]
-        value = self.value_head(x)  # [B, 1]
-        return F.softmax(policy, dim=1), value
+        policy = self.policy_head(x).view(-1, self.board_size * self.board_size)  # logits, no softmax!
+        value = self.value_head(x)
+        return policy, value
