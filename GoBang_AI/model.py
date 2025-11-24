@@ -1,7 +1,7 @@
+# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 class game_net(nn.Module):
     def __init__(self, board_size=15, num_channels=64):
@@ -24,6 +24,6 @@ class game_net(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
 
-        policy = self.policy_head(x).view(-1, self.board_size * self.board_size)  # logits, no softmax!
+        policy = self.policy_head(x).view(-1, self.board_size * self.board_size)
         value = self.value_head(x)
         return policy, value
