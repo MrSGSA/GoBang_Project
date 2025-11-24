@@ -9,6 +9,7 @@ from mcts import MCTS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def print_board(board):
     size = board.shape[0]
     print("\n   ", end="")
@@ -26,6 +27,7 @@ def print_board(board):
                 print(" · ", end="")
         print()
     print()
+
 
 def human_move(env):
     while True:
@@ -49,6 +51,7 @@ def human_move(env):
         except (ValueError, KeyboardInterrupt):
             print("Invalid input. Please enter two numbers like '7 7'.")
 
+
 def is_winning_move(board, x, y, player, size=15):
     directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
     for dx, dy in directions:
@@ -69,6 +72,7 @@ def is_winning_move(board, x, y, player, size=15):
             return True
     return False
 
+
 def ai_move(model, env, human_player, use_mcts=True):
     if use_mcts:
         mcts = MCTS(model, num_simulations=300, device=DEVICE)
@@ -84,16 +88,23 @@ def ai_move(model, env, human_player, use_mcts=True):
                 return action
 
         with torch.no_grad():
-            state_tensor = torch.tensor(env.board, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            state_tensor = (
+                torch.tensor(env.board, dtype=torch.float32)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(DEVICE)
+            )
             policy_logits, _ = model(state_tensor)
             policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
 
-        mask = np.zeros_like(policy); mask[valid_actions] = 1.0
+        mask = np.zeros_like(policy)
+        mask[valid_actions] = 1.0
         policy *= mask
         if policy.sum() > 0:
             return int(np.argmax(policy))
         else:
             return valid_actions[0]
+
 
 def main():
     model_path = "gomoku_final.pth"
@@ -111,7 +122,11 @@ def main():
     print("Board size: 15×15\n")
 
     while True:
-        choice = input("Play as Black (●, first) or White (○, second)? [b/w]: ").strip().lower()
+        choice = (
+            input("Play as Black (●, first) or White (○, second)? [b/w]: ")
+            .strip()
+            .lower()
+        )
         if choice in ["b", "black"]:
             human_player = 1
             print("You are Black. You go first.")
@@ -170,6 +185,7 @@ def main():
                 pickle.dump(existing, f)
             print(f"✅ Game saved! Added {len(data)} samples.")
             break
+
 
 if __name__ == "__main__":
     main()
