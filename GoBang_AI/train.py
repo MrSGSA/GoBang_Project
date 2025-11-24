@@ -193,4 +193,4 @@ def train(total_epochs=2000, start_epoch=900):
     print("\n🎉 Training finished!")
 
 if __name__ == "__main__":
-    train(total_epochs=2000, start_epoch=900)
+    train(total_epochs=3000, start_epoch=2000)
