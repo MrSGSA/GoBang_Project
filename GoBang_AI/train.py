@@ -3,190 +3,217 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from rule import game_rule
-from model import game_net
 import random
 import os
-import pickle
-from mcts import MCTS  # 👈 新增导入
+from collections import deque
 
+from rule import game_rule  # 假设这是你的棋盘逻辑
+from model import game_net  # 假设这是你的网络
+from mcts import MCTS  # 这是修改后的 MCTS
+
+# --- 全局配置 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BOARD_SIZE = 15
+BUFFER_CAPACITY = 30000  # 增大 Buffer，防止遗忘
+BATCH_SIZE = 128  # 增大 Batch size，梯度更稳
+LR = 2e-4  # 稍微调高一点
+L2_REG = 1e-4
+CHECKPOINT_FREQ = 1
 
 
-def load_human_data(path="human_games.pkl", weight=1):
-    if not os.path.exists(path):
-        return []
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-    print(f"  ➕ Loaded {len(data)} human samples")
-    return data * weight
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, data):
+        self.buffer.extend(data)
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
 
 
-# ===== 新增：使用 MCTS 的 self-play =====
-def self_play_with_mcts(model, env, num_games=100, num_simulations=200):
-    """用 MCTS 生成高质量对局"""
+def get_equi_data(play_data):
+    """
+    数据增强：旋转和翻转，数据量 x8
+    play_data: list of (state, probs, value)
+    """
+    extended_data = []
+    for state, mcts_prob, winner in play_data:
+        # state: [15, 15], mcts_prob: [225]
+        for i in [1, 2, 3, 4]:
+            # 旋转
+            equi_state = np.array([np.rot90(state, i)])
+            equi_mcts_prob = np.rot90(np.flipud(
+                mcts_prob.reshape(BOARD_SIZE, BOARD_SIZE)), i)
+            extended_data.append((equi_state[0], np.flipud(equi_mcts_prob).flatten(), winner))
+
+            # 翻转
+            equi_state = np.array([np.fliplr(state)])
+            equi_mcts_prob = np.fliplr(np.flipud(
+                mcts_prob.reshape(BOARD_SIZE, BOARD_SIZE)))
+            extended_data.append((equi_state[0], np.flipud(equi_mcts_prob).flatten(), winner))
+    return extended_data
+
+
+def self_play(model, env, mcts, num_games=1):
     data = []
     model.eval()
-    for _ in range(num_games):
-        env.reset()
-        states, actions, values = [], [], []
-        mcts_player = MCTS(model, num_simulations=num_simulations, device=DEVICE)
 
-        while env.winner == 0 and not np.all(env.board):
-            states.append(env.board.copy())
-            action = mcts_player.run(env)
-            actions.append(action)
+    for i in range(num_games):
+        env.reset()
+        mcts.reset_player()  # 重置 MCTS 树
+        states, mcts_probs, current_players = [], [], []
+
+        while True:
+            # 获取当前玩家 ID (1 或 -1)
+            # 假设 rule.py 中 steps 计数，偶数步是黑(1)，奇数步是白(-1)
+            player = 1 if len(env.steps) % 2 == 0 else -1
+
+            # MCTS 搜索
+            # temp: 前几步温度高一点，增加探索；后面温度降低，选最好的
+            temp = 1.0 if len(env.steps) < 8 else 1e-3
+            action, action_probs = mcts.get_action(env, temp=temp, return_prob=1)
+
+            # --- 🔥 关键：存入 canonical state (当前玩家视角) ---
+            # 如果当前是白棋(-1)，存进去的盘面要乘以 -1，变成 "1代表己方"
+            states.append(env.board * player)
+            mcts_probs.append(action_probs)
+            current_players.append(player)
+
+            # 执行动作
             env.step(action)
 
-        winner = env.winner
-        for i in range(len(states)):
-            player = 1 if i % 2 == 0 else -1
-            values.append(winner * player)
-        data.extend(zip([s.astype(np.float32) for s in states], actions, values))
+            winner, end = env.has_a_winner()
+            if end:
+                # winner: 1(黑胜), -1(白胜), 0(平)
+                # 为每一步分配 Value
+                winners_z = np.zeros(len(current_players))
+                if winner != 0:
+                    for j, p in enumerate(current_players):
+                        # 如果 winner == p (这一步的玩家赢了)，则 v = +1
+                        # 如果 winner != p (这一步的玩家输了)，则 v = -1
+                        winners_z[j] = 1.0 if winner == p else -1.0
+
+                # 打包这一局的数据
+                data.extend(get_equi_data(zip(states, mcts_probs, winners_z)))
+                break
     return data
 
 
-def evaluate_model(model, env, num_games=100, use_mcts=False):
+def evaluate_network(model, env, mcts, num_games=10):
+    """
+    评估：当前模型 vs 纯 MCTS (或弱一点的旧模型)
+    这里简单起见，做 MCTS vs Random 或者 MCTS (Model) vs MCTS (Weak)
+    """
     model.eval()
-    wins, losses, draws = 0, 0, 0
+    mcts_sims = 100  # 评估时不需要太深，速度优先
+    wins = 0
 
-    with torch.no_grad():
-        for _ in range(num_games):
-            env.reset()
-            if use_mcts:
-                # ===== MCTS 模式 =====
-                mcts_player = MCTS(model, num_simulations=300, device=DEVICE)
-                while env.winner == 0 and not np.all(env.board):
-                    action = mcts_player.run(env)
-                    env.step(action)
-                    # 随机对手
-                    if env.winner == 0 and not np.all(env.board):
-                        env.step(random.choice(env.get_valid_actions()))
+    for i in range(num_games):
+        env.reset()
+        mcts.reset_player()
+        mcts.set_simulations(mcts_sims)  # 临时调整模拟次数
+
+        model_player = 1 if i % 2 == 0 else -1  # 轮流执黑
+
+        while True:
+            player = 1 if len(env.steps) % 2 == 0 else -1
+
+            if player == model_player:
+                # 模型走棋 (低温度，追求最强)
+                action = mcts.get_action(env, temp=1e-3)
             else:
-                # ===== Greedy 模式 =====
-                while env.winner == 0 and not np.all(env.board):
-                    state_tensor = (
-                        torch.tensor(env.board, dtype=torch.float32)
-                        .unsqueeze(0)
-                        .unsqueeze(0)
-                        .to(DEVICE)
-                    )
-                    policy_logits, _ = model(state_tensor)
-                    policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
-                    valid = env.get_valid_actions()
-                    mask = np.zeros_like(policy)
-                    mask[valid] = 1
-                    policy *= mask
-                    action = (
-                        np.argmax(policy) if policy.sum() > 0 else random.choice(valid)
-                    )
-                    env.step(action)
-                    # 随机对手
-                    if env.winner == 0 and not np.all(env.board):
-                        env.step(random.choice(env.get_valid_actions()))
+                # 对手走棋 (这里用随机作为基准，或者弱 MCTS)
+                valid_moves = env.get_valid_actions()
+                action = random.choice(valid_moves)
 
-            if env.winner == 1:
-                wins += 1
-            elif env.winner == -1:
-                losses += 1
-            else:
-                draws += 1
-
-    win_rate = wins / num_games
-    mode = "MCTS" if use_mcts else "Greedy"
-    print(
-        f"  📊 Eval ({mode}) vs Random: W{wins} L{losses} D{draws} → Win Rate: {win_rate:.2%}"
-    )
-    return win_rate
+            env.step(action)
+            winner, end = env.has_a_winner()
+            if end:
+                if winner == model_player:
+                    wins += 1
+                break
+    return wins / num_games
 
 
-def train(total_epochs=2500, start_epoch=2000):
+def train_cycle(start_epoch=0):
+    # 初始化
     env = game_rule()
     model = game_net().to(DEVICE)
 
-    # 🔑 从 epoch 2000 恢复最强模型
-    best_ckpt = f"gomoku_model_epoch{start_epoch}.pth"
-    if os.path.exists(best_ckpt):
-        model.load_state_dict(torch.load(best_ckpt, map_location=DEVICE))
-        print(f"✅ Resuming from strongest model: {best_ckpt}")
-    else:
-        raise RuntimeError(f"Model '{best_ckpt}' not found!")
+    # 加载模型
+    if start_epoch > 0:
+        model_path = f"gomoku_model_epoch{start_epoch}.pth"
+        if os.path.exists(model_path):
+            model.load_state_dict(torch.load(model_path))
+            print(f"Loaded {model_path}")
 
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    policy_criterion = nn.CrossEntropyLoss()
-    value_criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=L2_REG)
+    replay_buffer = ReplayBuffer(BUFFER_CAPACITY)
 
-    best_win_rate = 0.0
-    eval_log_path = "win_rate_log.txt"
-    if not os.path.exists(eval_log_path):
-        with open(eval_log_path, "w") as f:
-            f.write("epoch,win_rate\n")
+    # 初始化 MCTS
+    # c_puct: 探索常数，通常 5.0
+    mcts = MCTS(model, c_puct=5, n_playout=400, device=DEVICE)
 
-    for epoch in range(start_epoch, total_epochs):
-        print(f"\nEpoch {epoch + 1}/{total_epochs}")
+    for epoch in range(start_epoch, 5000):
+        print(f"Epoch {epoch + 1} | Buffer: {len(replay_buffer)}")
 
-        # ===== 关键：用 MCTS 生成高质量数据 =====
-        print("  🌲 Generating MCTS self-play data...")
-        data_mcts = self_play_with_mcts(model, env, num_games=80, num_simulations=250)
+        # 1. 动态调整参数
+        if epoch < 20:
+            games_num, sims, train_steps = 10, 100, 100
+        elif epoch < 50:
+            games_num, sims, train_steps = 10, 200, 200
+        else:
+            games_num, sims, train_steps = 10, 400, 300
 
-        # 加入人类数据（防遗忘）
-        data_human = load_human_data(weight=2)
+        # 设置 MCTS 模拟次数
+        mcts.set_simulations(sims)
 
-        data = data_mcts + data_human
-        random.shuffle(data)
-        print(f"  Data: {len(data_mcts)} MCTS + {len(data_human) // 2} human(x2)")
+        # 2. 自我对弈收集数据
+        new_data = self_play(model, env, mcts, num_games=games_num)
+        replay_buffer.push(new_data)
 
-        # 训练
-        model.train()
-        total_loss = 0.0
-        batch_size = 64  # MCTS 数据少，减小 batch
-        for i in range(0, len(data), batch_size):
-            batch = data[i : i + batch_size]
-            states = (
-                torch.from_numpy(np.stack([d[0] for d in batch]))
-                .unsqueeze(1)
-                .to(DEVICE)
-            )
-            actions = torch.tensor([d[1] for d in batch], dtype=torch.long).to(DEVICE)
-            values = torch.tensor([[d[2]] for d in batch], dtype=torch.float32).to(
-                DEVICE
-            )
+        # 3. 训练
+        if len(replay_buffer) > BATCH_SIZE:
+            model.train()
+            loss_sum = 0
+            for _ in range(train_steps):
+                batch = replay_buffer.sample(BATCH_SIZE)
+                # 解包数据
+                state_batch = torch.FloatTensor(np.array([d[0] for d in batch])).to(DEVICE).unsqueeze(
+                    1)  # [B, 1, 15, 15]
+                mcts_probs_batch = torch.FloatTensor(np.array([d[1] for d in batch])).to(DEVICE)
+                winner_batch = torch.FloatTensor(np.array([d[2] for d in batch])).to(DEVICE).unsqueeze(1)
 
-            optimizer.zero_grad()
-            pred_policy, pred_value = model(states)
-            loss = policy_criterion(pred_policy, actions) + value_criterion(
-                pred_value, values
-            )
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+                optimizer.zero_grad()
+                # 前向传播
+                log_act_probs, value = model(state_batch)
 
-        avg_loss = total_loss / max(1, len(data) // batch_size)
-        print(f"  Avg Loss: {avg_loss:.4f}")
+                # Loss 计算
+                # Value Loss (MSE)
+                value_loss = nn.MSELoss()(value, winner_batch)
+                # Policy Loss (Cross Entropy) - 注意 mcts_probs 是概率，模型输出是 log_softmax
+                # 手动计算交叉熵: -sum(target * log_pred)
+                policy_loss = -torch.mean(torch.sum(mcts_probs_batch * log_act_probs, dim=1))
 
-        # 每 100 轮评估（同时测 greedy 和 MCTS）
-        if (epoch + 1) % 100 == 0:
-            win_rate_greedy = evaluate_model(model, env, num_games=50, use_mcts=False)
-            win_rate_mcts = evaluate_model(model, env, num_games=50, use_mcts=True)
+                loss = value_loss + policy_loss
+                loss.backward()
+                optimizer.step()
+                loss_sum += loss.item()
 
-            # 保存
-            ckpt_path = f"gomoku_model_epoch{epoch + 1}.pth"
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"  📦 Saved {ckpt_path}")
+            print(f"  Loss: {loss_sum / train_steps:.4f}")
 
-            # 以 MCTS 胜率为准保存最佳模型
-            current_best = win_rate_mcts
-            if current_best > best_win_rate:
-                best_win_rate = current_best
-                torch.save(model.state_dict(), "gomoku_best.pth")
-                print(f"  🏆 New best model (MCTS) saved! Win rate: {current_best:.2%}")
+        # 4. 保存与评估
+        if (epoch + 1) % CHECKPOINT_FREQ == 0:
+            torch.save(model.state_dict(), f"gomoku_model_epoch{epoch + 1}.pth")
 
-            with open(eval_log_path, "a") as f:
-                f.write(f"{epoch + 1},{win_rate_mcts:.4f}\n")
-
-    torch.save(model.state_dict(), "gomoku_final.pth")
-    print(f"\n🎉 Training finished! Best MCTS win rate: {best_win_rate:.2%}")
+        if (epoch + 1) % 10 == 0:
+            win_rate = evaluate_network(model, env, mcts)
+            print(f"  📊 Win Rate vs Random: {win_rate:.2%}")
 
 
 if __name__ == "__main__":
-    train(total_epochs=2500, start_epoch=2000)
+    train_cycle(0)
