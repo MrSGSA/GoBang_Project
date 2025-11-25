@@ -37,24 +37,30 @@ class ReplayBuffer:
 
 def get_equi_data(play_data):
     """
-    数据增强：旋转和翻转，数据量 x8
+    数据增强：利用旋转和翻转，将 1 条数据扩充为 8 条
     play_data: list of (state, probs, value)
     """
     extended_data = []
     for state, mcts_prob, winner in play_data:
-        # state: [15, 15], mcts_prob: [225]
-        for i in [1, 2, 3, 4]:
-            # 旋转
-            equi_state = np.array([np.rot90(state, i)])
-            equi_mcts_prob = np.rot90(np.flipud(
-                mcts_prob.reshape(BOARD_SIZE, BOARD_SIZE)), i)
-            extended_data.append((equi_state[0], np.flipud(equi_mcts_prob).flatten(), winner))
+        # state: [15, 15]
+        # mcts_prob: [225] -> 还原成 [15, 15] 用于几何变换
+        prob_img = mcts_prob.reshape(BOARD_SIZE, BOARD_SIZE)
 
-            # 翻转
-            equi_state = np.array([np.fliplr(state)])
-            equi_mcts_prob = np.fliplr(np.flipud(
-                mcts_prob.reshape(BOARD_SIZE, BOARD_SIZE)))
-            extended_data.append((equi_state[0], np.flipud(equi_mcts_prob).flatten(), winner))
+        for i in [0, 1, 2, 3]:  # 旋转 0, 90, 180, 270 度
+            # 1. 旋转
+            rot_state = np.rot90(state, i)
+            rot_prob = np.rot90(prob_img, i)
+
+            # 添加旋转后的数据
+            extended_data.append((rot_state, rot_prob.flatten(), winner))
+
+            # 2. 翻转 (在旋转的基础上进行左右翻转)
+            flip_state = np.fliplr(rot_state)
+            flip_prob = np.fliplr(rot_prob)
+
+            # 添加翻转后的数据
+            extended_data.append((flip_state, flip_prob.flatten(), winner))
+
     return extended_data
 
 
@@ -156,7 +162,7 @@ def train_cycle(start_epoch=0):
 
     # 初始化 MCTS
     # c_puct: 探索常数，通常 5.0
-    mcts = MCTS(model, c_puct=5, n_playout=400, device=DEVICE)
+    mcts = MCTS(model, c_puct=5, num_simulations=400, device=DEVICE)
 
     for epoch in range(start_epoch, 5000):
         print(f"Epoch {epoch + 1} | Buffer: {len(replay_buffer)}")
