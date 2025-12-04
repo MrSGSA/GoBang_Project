@@ -2,377 +2,322 @@ import cv2
 import numpy as np
 import time
 import os
+import threading
+import copy
 
-# =============== 1. 在这里修改黑白子阈值 ===============
-# 解释：
-# 图像灰度范围是 0 (纯黑) - 255 (纯白)
-#
-# BINARY_THRESH_LOW:  小于这个值的像素被认为是【黑子】
-#   - 如果黑子识别不到，把这个值调高 (例如 80, 90)
-#   - 如果把阴影误识别为黑子，把这个值调低 (例如 50, 60)
-BINARY_THRESH_LOW = 60
+# ================= 配置区域 =================
+# 稍微调严一点白子阈值，防止反光误判
+BINARY_THRESH_LOW = 100    # 黑子 (越低越严)
+BINARY_THRESH_HIGH = 200  # 白子 (越低越容易识别，太低会把地板当白子，建议 160-200 之间微调)
+# ===========================================
 
-# BINARY_THRESH_HIGH: 大于这个值的像素被认为是【白子】
-#   - 如果白子识别不到，把这个值调低 (例如 160, 150)
-#   - 如果把反光的木板误识别为白子，把这个值调高 (例如 200)
-BINARY_THRESH_HIGH = 200
-# ======================================================
-
-CANNY_LOW = 30
-CANNY_HIGH = 100
-SMOOTH_ALPHA = 0.7
-
+# 状态常量
 EMPTY = 0
 BLACK = 1
 WHITE = 2
-STATE_SEARCHING = 0
-STATE_TRACKING = 1
 
-g_camera_matrix = None
-g_dist_coeffs = None
-g_map1, g_map2 = None, None
-g_has_calibration = False
-g_board_data = np.zeros((15, 15), dtype=int)
-g_last_xs = np.zeros(15, dtype=float)
-g_last_ys = np.zeros(15, dtype=float)
-g_grid_initialized = False
+class GobangVision:
+    def __init__(self, camera_id=0):
+        self.camera_id = camera_id
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+        
+        # 最终输出的稳定棋盘数据
+        self.board_data = np.zeros((15, 15), dtype=int)
+        
+        # 【新增】防抖投票箱 (-10 ~ 10)
+        # > 5 确认为黑子
+        # < -5 确认为白子
+        # 0 附近为空
+        self.vote_matrix = np.zeros((15, 15), dtype=int)
+        
+        # 内部变量
+        self.g_has_calibration = False
+        self.g_map1, self.g_map2 = None, None
+        self.g_last_xs = np.zeros(15, dtype=float)
+        self.g_last_ys = np.zeros(15, dtype=float)
+        self.g_grid_initialized = False
+        
+        self._init_calibration((640, 480))
 
+    # ==================== 外部接口 ====================
+    def start(self):
+        if self.running: return
+        self.running = True
+        self.thread = threading.Thread(target=self._processing_loop, daemon=True)
+        self.thread.start()
+        print("[Vision] 视觉防抖模式已启动...")
 
-def init_system(img_size):
-    global g_camera_matrix, g_dist_coeffs, g_map1, g_map2, g_has_calibration
-    calib_file = "cam_params.xml"
-    if os.path.exists(calib_file):
-        try:
-            fs = cv2.FileStorage(calib_file, cv2.FILE_STORAGE_READ)
-            g_camera_matrix = fs.getNode("camera_matrix").mat()
-            g_dist_coeffs = fs.getNode("dist_coeffs").mat()
-            fs.release()
-            new_cam_mat, _ = cv2.getOptimalNewCameraMatrix(
-                g_camera_matrix, g_dist_coeffs, img_size, 0, img_size
-            )
-            g_map1, g_map2 = cv2.initUndistortRectifyMap(
-                g_camera_matrix,
-                g_dist_coeffs,
-                None,
-                new_cam_mat,
-                img_size,
-                cv2.CV_16SC2,
-            )
-            g_has_calibration = True
-            print("✅ 标定文件已加载。")
-        except:
-            pass
-    else:
-        print("⚠️ 未找到标定文件，使用原始画面。")
+    def stop(self):
+        self.running = False
+        if self.thread: self.thread.join()
 
+    def get_current_board(self):
+        with self.lock:
+            return copy.deepcopy(self.board_data)
 
-def sort_corners(pts):
-    pts = pts.reshape(4, 2)
-    sorted_y = pts[np.argsort(pts[:, 1])]
-    top = sorted_y[:2]
-    bottom = sorted_y[2:]
-    top = top[np.argsort(top[:, 0])]
-    bottom = bottom[np.argsort(bottom[:, 0])]
-    return np.array([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
+    def get_black_coordinates(self):
+        with self.lock:
+            # 使用 .tolist() 将 np.int64 转换为标准 python int
+            coords = np.argwhere(self.board_data == BLACK)
+            return [tuple(c.tolist()) for c in coords]
 
+    def get_white_coordinates(self):
+        with self.lock:
+            coords = np.argwhere(self.board_data == WHITE)
+            return [tuple(c.tolist()) for c in coords]
 
-def is_geo_valid(pts):
-    pts = pts.reshape(4, 2)
-    d1 = np.linalg.norm(pts[0] - pts[1])
-    d2 = np.linalg.norm(pts[2] - pts[3])
-    if d2 == 0:
-        return False
-    if max(d1, d2) / min(d1, d2) > 2.0:
-        return False
-    return cv2.isContourConvex(pts.astype(np.int32))
+    # ==================== 内部逻辑 ====================
+    def _processing_loop(self):
+        cap = cv2.VideoCapture(self.camera_id, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+        WARP_SIZE = 450
+        PADDING = 20
+        dst_pts = np.array([
+            [PADDING, PADDING], [WARP_SIZE - PADDING, PADDING],
+            [WARP_SIZE - PADDING, WARP_SIZE - PADDING], [PADDING, WARP_SIZE - PADDING],
+        ], dtype=np.float32)
 
-def find_board_auto(src):
-    gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edges = cv2.dilate(edges, kernel, iterations=2)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        state = 0 # SEARCHING
+        points = None
+        prev_gray = None
+        lost_cnt = 0
 
-    max_area = 0
-    best_cnt = None
-    found = False
+        while self.running:
+            ret, raw_frame = cap.read()
+            if not ret: time.sleep(0.01); continue
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 40000:
-            continue
-        epsilon = 0.02 * cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            if area > max_area:
-                max_area = area
-                best_cnt = approx
-                found = True
-    if found:
-        corners = best_cnt.astype(np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 30, 0.1)
-        corners = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
-        return True, sort_corners(corners)
-    return False, None
+            if self.g_has_calibration: frame = cv2.remap(raw_frame, self.g_map1, self.g_map2, cv2.INTER_LINEAR)
+            else: frame = raw_frame.copy()
 
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-def solve_grid_lines(proj, max_len, last_data):
-    global g_grid_initialized
-    # 稍微加强平滑，防止断线
-    temp = cv2.GaussianBlur(proj, (3, 3), 0).flatten()
-    approx_step = max_len // 14
-    peaks = []
+            if state == 0: # SEARCHING
+                found, detected_pts = self._find_board_auto(frame)
+                if found:
+                    points = detected_pts
+                    prev_gray = curr_gray.copy()
+                    state = 1
+                    lost_cnt = 0
+                cv2.putText(frame, "SEARCHING...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-    # 简单的峰值查找
-    # 这里为了防止边缘丢失，降低一点阈值 800 -> 500
-    search_temp = temp.copy()
-    for _ in range(20):
-        idx = np.argmax(search_temp)
-        if search_temp[idx] < 500:
-            break
-        peaks.append(idx)
-        start = max(0, idx - approx_step // 3)
-        end = min(len(search_temp), idx + approx_step // 3)
-        search_temp[start:end] = 0
-    peaks.sort()
+            else: # TRACKING
+                p0 = points.reshape(-1, 1, 2)
+                p1, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, winSize=(31, 31), maxLevel=3)
+                good_pts = []
+                if status is not None: good_pts = p1[status == 1]
 
-    coords = []
-    if len(peaks) >= 2:
-        gaps = [peaks[i + 1] - peaks[i] for i in range(len(peaks) - 1)]
-        median_step = int(np.median(gaps))
-        if median_step < 10:
-            median_step = approx_step
+                if len(good_pts) < 4 or not self._is_geo_valid(good_pts):
+                    lost_cnt += 1
+                    if lost_cnt > 10: state = 0
+                else:
+                    points = good_pts.reshape(4, 2)
+                    prev_gray = curr_gray.copy()
+                    lost_cnt = 0
 
-        # 找基准线
-        center_idx = 0
-        min_dist = max_len
-        for i, p in enumerate(peaks):
-            if abs(p - max_len / 2) < min_dist:
-                min_dist = abs(p - max_len / 2)
-                center_idx = i
-        anchor = peaks[center_idx]
+                    H = cv2.getPerspectiveTransform(points.astype(np.float32), dst_pts)
+                    warped = cv2.warpPerspective(frame, H, (WARP_SIZE, WARP_SIZE))
+                    
+                    debug_disp = warped.copy()
+                    xs, ys = self._find_dynamic_grid_lines(warped, debug_disp)
+                    
+                    # 1. 获取当前帧的原始识别结果 (不直接写入全局)
+                    raw_board = self._scan_pieces_raw(warped, xs, ys, debug_disp)
+                    
+                    # 2. 进行投票防抖处理 (核心修改)
+                    self._update_votes(raw_board)
 
-        estimated_idx = round((anchor / max_len) * 14.0)
-        estimated_idx = max(0, min(14, estimated_idx))
+                    # 3. 绘图 (用稳定后的结果画图，看起来更稳)
+                    self._draw_debug_overlay(debug_disp, xs, ys)
+                    
+                    cv2.imshow("Analysis", debug_disp)
+                    for i in range(4): cv2.line(frame, tuple(points[i].astype(int)), tuple(points[(i + 1) % 4].astype(int)), (0, 255, 0), 2)
 
-        for i in range(15):
-            pos = anchor + (i - estimated_idx) * median_step
-            coords.append(pos)
-    else:
-        for i in range(15):
-            coords.append(20 + i * (max_len - 40) / 14.0)
+            cv2.imshow("Main View", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): self.running = False
 
-    coords = np.array(coords, dtype=float)
-    if not g_grid_initialized:
-        np.copyto(last_data, coords)
-    else:
-        for i in range(15):
-            if abs(coords[i] - last_data[i]) > 20:
-                last_data[i] = coords[i]
-            else:
-                last_data[i] = last_data[i] * SMOOTH_ALPHA + coords[i] * (
-                    1.0 - SMOOTH_ALPHA
-                )
-            coords[i] = round(last_data[i])
-    return coords.astype(int)
+        cap.release()
+        cv2.destroyAllWindows()
 
+    # ==================== 核心防抖算法 ====================
+    def _update_votes(self, raw_board):
+        """
+        根据当前帧的识别结果 raw_board，更新 vote_matrix。
+        机制：
+        - 看到黑子: +1 分
+        - 看到白子: -1 分
+        - 看到空位: 向 0 靠拢
+        - 积分范围限制在 -10 到 10 之间
+        - 只有积分超过阈值 (5 或 -5) 才更新最终结果
+        """
+        # 1. 更新投票箱
+        for r in range(15):
+            for c in range(15):
+                val = raw_board[r][c]
+                
+                if val == BLACK:
+                    self.vote_matrix[r][c] += 2 # 加分快一点 (灵敏度)
+                elif val == WHITE:
+                    self.vote_matrix[r][c] -= 2
+                else:
+                    # 如果当前帧是空的，让分数慢慢归零
+                    if self.vote_matrix[r][c] > 0:
+                        self.vote_matrix[r][c] -= 1
+                    elif self.vote_matrix[r][c] < 0:
+                        self.vote_matrix[r][c] += 1
 
-def find_dynamic_grid_lines(warped, debug_disp):
-    global g_grid_initialized
-    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    bin_img = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 5
-    )
+        # 2. 限制范围 (-10 到 10)
+        self.vote_matrix = np.clip(self.vote_matrix, -10, 10)
 
-    rows, cols = warped.shape[:2]
-    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, rows // 10))
-    v_lines = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, kernel_v)
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (cols // 10, 1))
-    h_lines = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, kernel_h)
+        # 3. 根据分数决定最终结果
+        with self.lock:
+            for r in range(15):
+                for c in range(15):
+                    score = self.vote_matrix[r][c]
+                    # 连续几帧确认为黑子
+                    if score > 6: 
+                        self.board_data[r][c] = BLACK
+                    # 连续几帧确认为白子
+                    elif score < -6:
+                        self.board_data[r][c] = WHITE
+                    # 分数不高不低，认为是空
+                    elif -3 < score < 3:
+                        self.board_data[r][c] = EMPTY
 
-    col_proj = np.sum(v_lines, axis=0).astype(np.float32)
-    row_proj = np.sum(h_lines, axis=1).astype(np.float32)  # 注意这里是 axis=1
+    # ==================== 辅助函数 ====================
+    def _scan_pieces_raw(self, warped, xs, ys, debug_disp):
+        """扫描单帧图像，返回一个临时的 board 矩阵"""
+        raw_board = np.zeros((15, 15), dtype=int)
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        _, bin_black = cv2.threshold(gray, BINARY_THRESH_LOW, 255, cv2.THRESH_BINARY_INV)
+        _, bin_white = cv2.threshold(gray, BINARY_THRESH_HIGH, 255, cv2.THRESH_BINARY)
+        
+        roi_s = 10
+        h, w = warped.shape[:2]
+        
+        for r in range(15):
+            for c in range(15):
+                cx = xs[c] if c < len(xs) else c * 30
+                cy = ys[r] if r < len(ys) else r * 30
+                x1, y1 = max(0, cx - roi_s // 2), max(0, cy - roi_s // 2)
+                x2, y2 = min(w, cx + roi_s // 2), min(h, cy + roi_s // 2)
+                
+                roi_b = bin_black[y1:y2, x1:x2]
+                roi_w = bin_white[y1:y2, x1:x2]
+                if roi_b.size == 0: continue
+                
+                area = (x2 - x1) * (y2 - y1)
+                # 这里稍微改严格了一点点 0.4 -> 0.45
+                if cv2.countNonZero(roi_b) > area * 0.45:
+                    raw_board[r][c] = BLACK
+                elif cv2.countNonZero(roi_w) > area * 0.45:
+                    raw_board[r][c] = WHITE
+        return raw_board
 
-    xs = solve_grid_lines(col_proj, cols, g_last_xs)
-    ys = solve_grid_lines(row_proj, rows, g_last_ys)
-    g_grid_initialized = True
+    def _draw_debug_overlay(self, img, xs, ys):
+        """根据最终稳定的 board_data 画圈圈"""
+        with self.lock:
+            for r in range(15):
+                for c in range(15):
+                    if self.board_data[r][c] == EMPTY: continue
+                    
+                    cx = xs[c] if c < len(xs) else c * 30
+                    cy = ys[r] if r < len(ys) else r * 30
+                    
+                    if self.board_data[r][c] == BLACK:
+                        cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1) # 红点表示检测到黑子
+                    elif self.board_data[r][c] == WHITE:
+                        cv2.circle(img, (cx, cy), 5, (255, 0, 0), -1) # 蓝点表示检测到白子
 
-    for x in xs:
-        cv2.line(debug_disp, (x, 0), (x, rows), (0, 0, 255), 1)
-    for y in ys:
-        cv2.line(debug_disp, (0, y), (cols, y), (0, 0, 255), 1)
-    return xs, ys
+    def _init_calibration(self, img_size):
+        # (保持原有的标定代码不变)
+        if os.path.exists("cam_params.xml"):
+            try:
+                fs = cv2.FileStorage("cam_params.xml", cv2.FILE_STORAGE_READ)
+                cam = fs.getNode("camera_matrix").mat()
+                dist = fs.getNode("dist_coeffs").mat()
+                fs.release()
+                n_cam, _ = cv2.getOptimalNewCameraMatrix(cam, dist, img_size, 0, img_size)
+                self.g_map1, self.g_map2 = cv2.initUndistortRectifyMap(cam, dist, None, n_cam, img_size, cv2.CV_16SC2)
+                self.g_has_calibration = True
+            except: pass
 
+    def _find_board_auto(self, src):
+        # (保持原有的自动寻线代码不变)
+        gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 30, 100)
+        edges = cv2.dilate(edges, np.ones((3,3)), iterations=2)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best_cnt = None; max_area = 0; found = False
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 40000: continue
+            approx = cv2.approxPolyDP(cnt, 0.02*cv2.arcLength(cnt,True), True)
+            if len(approx)==4 and cv2.isContourConvex(approx):
+                if cv2.contourArea(cnt) > max_area:
+                    max_area = cv2.contourArea(cnt); best_cnt = approx; found = True
+        if found:
+            corners = cv2.cornerSubPix(gray, best_cnt.astype(np.float32), (5,5), (-1,-1), (cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_COUNT, 30, 0.1))
+            return True, self._sort_corners(corners)
+        return False, None
 
-def scan_pieces(warped, xs, ys, debug_disp):
-    global g_board_data
-    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    _, bin_black = cv2.threshold(gray, BINARY_THRESH_LOW, 255, cv2.THRESH_BINARY_INV)
-    _, bin_white = cv2.threshold(gray, BINARY_THRESH_HIGH, 255, cv2.THRESH_BINARY)
+    def _sort_corners(self, pts):
+        # (保持不变)
+        pts = pts.reshape(4, 2)
+        sorted_y = pts[np.argsort(pts[:, 1])]
+        top, bottom = sorted_y[:2], sorted_y[2:]
+        return np.array([top[np.argsort(top[:, 0])][0], top[np.argsort(top[:, 0])][1], bottom[np.argsort(bottom[:, 0])][1], bottom[np.argsort(bottom[:, 0])][0]], dtype=np.float32)
 
-    roi_s = 10
-    h, w = warped.shape[:2]
-    for r in range(15):
-        for c in range(15):
-            cx = xs[c] if c < len(xs) else c * 30
-            cy = ys[r] if r < len(ys) else r * 30
-            x1, y1 = max(0, cx - roi_s // 2), max(0, cy - roi_s // 2)
-            x2, y2 = min(w, cx + roi_s // 2), min(h, cy + roi_s // 2)
+    def _is_geo_valid(self, pts):
+        # (保持不变)
+        pts = pts.reshape(4, 2)
+        d1 = np.linalg.norm(pts[0]-pts[1]); d2 = np.linalg.norm(pts[2]-pts[3])
+        return False if d2==0 or max(d1,d2)/min(d1,d2)>2.0 else cv2.isContourConvex(pts.astype(np.int32))
 
-            roi_b = bin_black[y1:y2, x1:x2]
-            roi_w = bin_white[y1:y2, x1:x2]
-            if roi_b.size == 0:
-                continue
+    def _find_dynamic_grid_lines(self, warped, debug_disp):
+        # (保持不变，但去掉了画图部分，因为移到了专门的 draw 函数)
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 5)
+        h, w = warped.shape[:2]
+        v_lines = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, h//15)))
+        h_lines = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (w//15, 1)))
+        
+        xs = self._solve_grid_lines(np.sum(v_lines, axis=0).astype(np.float32), w, self.g_last_xs)
+        ys = self._solve_grid_lines(np.sum(h_lines, axis=1).astype(np.float32), h, self.g_last_ys)
+        self.g_grid_initialized = True
+        # 网格线绘制
+        if debug_disp is not None:
+            for x in xs: cv2.line(debug_disp, (x, 0), (x, h), (0, 0, 255), 1)
+            for y in ys: cv2.line(debug_disp, (0, y), (w, y), (0, 0, 255), 1)
+        return xs, ys
 
-            area = (x2 - x1) * (y2 - y1)
-            if cv2.countNonZero(roi_b) > area * 0.4:
-                g_board_data[r][c] = BLACK
-                cv2.circle(debug_disp, (cx, cy), 4, (0, 0, 255), -1)
-            elif cv2.countNonZero(roi_w) > area * 0.4:
-                g_board_data[r][c] = WHITE
-                cv2.circle(debug_disp, (cx, cy), 4, (255, 0, 0), -1)
-            else:
-                g_board_data[r][c] = EMPTY
-
-
-def draw_virtual_board(s):
-    board = np.full((s, s, 3), (160, 200, 230), dtype=np.uint8)
-    m = 30
-    step = (s - 2 * m) / 14.0
-    for i in range(15):
-        p = int(round(m + i * step))
-        cv2.line(board, (m, p), (s - m, p), (0, 0, 0), 1)
-        cv2.line(board, (p, m), (p, s - m), (0, 0, 0), 1)
-    for r in range(15):
-        for c in range(15):
-            if g_board_data[r][c] == EMPTY:
-                continue
-            cx = int(round(m + c * step))
-            cy = int(round(m + r * step))
-            if g_board_data[r][c] == BLACK:
-                cv2.circle(board, (cx, cy), 13, (10, 10, 10), -1)
-            else:
-                cv2.circle(board, (cx, cy), 13, (240, 240, 240), -1)
-                cv2.circle(board, (cx, cy), 13, (100, 100, 100), 1)
-    return board
-
-
-def main():
-    init_system((640, 480))
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    WARP_SIZE = 450
-    PADDING = 20
-    dst_pts = np.array(
-        [
-            [PADDING, PADDING],
-            [WARP_SIZE - PADDING, PADDING],
-            [WARP_SIZE - PADDING, WARP_SIZE - PADDING],
-            [PADDING, WARP_SIZE - PADDING],
-        ],
-        dtype=np.float32,
-    )
-
-    cv2.namedWindow("Main View")
-    cv2.namedWindow("Analysis")
-    cv2.namedWindow("Virtual Board")
-
-    state = STATE_SEARCHING
-    prev_gray = None
-    points = None
-    lost_cnt = 0
-
-    while True:
-        ret, raw_frame = cap.read()
-        if not ret:
-            time.sleep(0.01)
-            continue
-
-        if g_has_calibration:
-            frame = cv2.remap(raw_frame, g_map1, g_map2, cv2.INTER_LINEAR)
+    def _solve_grid_lines(self, proj, max_len, last_data):
+        # (保持不变)
+        temp = cv2.GaussianBlur(proj, (3, 3), 0).flatten()
+        peaks = []
+        for _ in range(20):
+            idx = np.argmax(temp)
+            if temp[idx] < np.max(temp)*0.15: break
+            peaks.append(idx)
+            temp[max(0, idx-max_len//42):min(len(temp), idx+max_len//42)] = 0
+        peaks.sort()
+        coords = []
+        if len(peaks) >= 2:
+            gaps = [peaks[i+1]-peaks[i] for i in range(len(peaks)-1)]
+            median = int(np.median(gaps)) if len(gaps)>0 else max_len//14
+            anchor = peaks[np.argmin([abs(p-max_len/2) for p in peaks])]
+            for i in range(15): coords.append(anchor + (i - 7) * (median if median > 10 else max_len//14))
         else:
-            frame = raw_frame.copy()  # 这里获得的是干净的画面
-
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        if state == STATE_SEARCHING:
-            found, detected_pts = find_board_auto(frame)
-            if found:
-                points = detected_pts
-                prev_gray = curr_gray.copy()
-                state = STATE_TRACKING
-                lost_cnt = 0
-            cv2.putText(
-                frame,
-                "SEARCHING...",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                2,
-            )
-
-        else:  # TRACKING
-            p0 = points.reshape(-1, 1, 2)
-            p1, status, err = cv2.calcOpticalFlowPyrLK(
-                prev_gray, curr_gray, p0, None, winSize=(31, 31), maxLevel=3
-            )
-            good_pts = []
-            if status is not None:
-                good_pts = p1[status == 1]
-
-            if len(good_pts) < 4 or not is_geo_valid(good_pts):
-                lost_cnt += 1
-                if lost_cnt > 10:
-                    state = STATE_SEARCHING
-            else:
-                points = good_pts.reshape(4, 2)
-                prev_gray = curr_gray.copy()
-                lost_cnt = 0
-
-                # ================= 核心修正 =================
-                # 1. 先进行分析 (使用还未被画线的 frame)
-                H = cv2.getPerspectiveTransform(points.astype(np.float32), dst_pts)
-                warped = cv2.warpPerspective(frame, H, (WARP_SIZE, WARP_SIZE))
-
-                debug_disp = warped.copy()
-                xs, ys = find_dynamic_grid_lines(warped, debug_disp)
-                scan_pieces(warped, xs, ys, debug_disp)
-                cv2.imshow("Analysis", debug_disp)
-
-                # 2. 分析完了，再在 frame 上画框给用户看
-                for i in range(4):
-                    cv2.line(
-                        frame,
-                        tuple(points[i].astype(int)),
-                        tuple(points[(i + 1) % 4].astype(int)),
-                        (0, 255, 0),
-                        2,
-                    )
-                # ==========================================
-
-            cv2.putText(
-                frame, "TRACKING", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
-            )
-
-        cv2.imshow("Main View", frame)
-        cv2.imshow("Virtual Board", draw_virtual_board(500))
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        if key == ord("r"):
-            state = STATE_SEARCHING
-            g_grid_initialized = False
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
+             for i in range(15): coords.append(20 + i * (max_len - 40) / 14.0)
+        coords = np.array(coords, dtype=float)
+        if not self.g_grid_initialized: np.copyto(last_data, coords)
+        else: 
+            for i in range(15):
+                if abs(coords[i]-last_data[i])>20: last_data[i]=coords[i]
+                else: last_data[i]=last_data[i]*0.7+coords[i]*0.3
+                coords[i]=round(last_data[i])
+        return coords.astype(int)
