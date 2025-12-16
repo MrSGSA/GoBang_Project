@@ -1,96 +1,148 @@
+import cv2
 import numpy as np
+import time
 from ai import AI
 
-def simulate_game():
-    print("=== 五子棋 AI 对战模拟器（无摄像头） ===")
-    print("黑方（1）先手，白方（2）为 AI\n")
+BOARD_SIZE = 19
+EMPTY, BLACK, WHITE = 0, 1, 2
 
-    BOARD_SIZE = 19
+def create_virtual_board_image(board):
+    img = np.zeros((500, 500, 3), dtype=np.uint8)
+    img[:] = (130, 205, 238)  # 浅蓝背景
+    step = 500 // (BOARD_SIZE + 1)
+
+    # 画线
+    for i in range(BOARD_SIZE):
+        pos = step * (i + 1)
+        cv2.line(img, (pos, step), (pos, 500 - step), (0, 0, 0), 1)
+        cv2.line(img, (step, pos), (500 - step, pos), (0, 0, 0), 1)
+
+    # 星位
+    stars = [3, 9, 15]
+    for r in stars:
+        for c in stars:
+            cv2.circle(img, (step * (c + 1), step * (r + 1)), 3, (0, 0, 0), -1)
+
+    # 棋子
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            state = board[r, c]
+            cx = step * (c + 1)
+            cy = step * (r + 1)
+            if state == BLACK:
+                cv2.circle(img, (cx, cy), 11, (10, 10, 10), -1)
+            elif state == WHITE:
+                cv2.circle(img, (cx, cy), 11, (240, 240, 240), -1)
+                cv2.circle(img, (cx, cy), 11, (100, 100, 100), 1)
+    return img
+
+def get_black_move(board):
+    """黑方：轻量级 AI（评估打分选最佳）"""
+    brain = AI(board, my_color=BLACK)
+    moves = brain.get_legal_moves()
+    if not moves:
+        return None
+    best_move = moves[0]
+    best_score = -1
+    for r, c in moves:
+        board[r, c] = BLACK
+        score = brain.evaluate_color_fast(BLACK)
+        board[r, c] = EMPTY
+        if score > best_score:
+            best_score = score
+            best_move = (r, c)
+    return best_move
+
+def get_white_move(board):
+    """白方：你的主 AI（depth=2）"""
+    brain = AI(board, my_color=WHITE)
+    moves = brain.get_legal_moves()
+    if not moves:
+        return None
+
+    best_score = -float('inf')
+    best_move = moves[0]
+    SEARCH_DEPTH = 2
+    alpha = -float('inf')
+    beta = float('inf')
+
+    for r, c in moves:
+        brain.board[r, c] = WHITE
+        score = brain.minimax(SEARCH_DEPTH - 1, alpha, beta, False)
+        brain.board[r, c] = EMPTY
+
+        if score > best_score:
+            best_score = score
+            best_move = (r, c)
+        alpha = max(alpha, score)
+
+    return best_move
+
+def simulate_auto():
+    print("=== 全自动五子棋对战（仅虚拟棋盘 + 胜负判断） ===")
+    print("黑方（1）: 轻量AI\n白方（2）: 主AI（depth=2）\n")
+
     board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
-    
-    # 黑方先手
-    human_color = 1
-    ai_color = 2
-
     move_count = 0
 
-    while True:
-        current_color = human_color if move_count % 2 == 0 else ai_color
-        is_human_turn = (current_color == human_color)
+    # 创建窗口
+    cv2.namedWindow("Virtual Board", cv2.WINDOW_AUTOSIZE)
+    print("初始化窗口...")
+    time.sleep(1.5)  # 等待窗口加载
 
-        # 创建 AI 实例用于评估和胜负判断
-        brain = AI(board, my_color=ai_color)
-
-        # 检查是否已有胜者
-        winner = brain.check_winner()
-        if winner != 0:
-            print(f"\n🎉 胜负已分！{'黑方' if winner == 1 else '白方（AI）'} 获胜！")
-            break
-
-        # 检查是否平局（棋盘满）
-        if np.all(board != 0):
-            print("\n🤝 平局！棋盘已满。")
-            break
-
-        if is_human_turn:
-            print("\n[人类回合] 请输入落子位置（行 列，0~18）：")
-            try:
-                r, c = map(int, input().strip().split())
-                if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
-                    print("❌ 坐标越界，请重试。")
-                    continue
-                if board[r, c] != 0:
-                    print("❌ 该位置已有棋子，请重试。")
-                    continue
-                board[r, c] = human_color
-                print(f"黑方落子：({r}, {c})")
-            except (ValueError, KeyboardInterrupt):
-                print("\n👋 用户退出。")
-                return
-        else:
-            print("\n[AI 回合] AI 正在思考...")
-            moves = brain.get_legal_moves()
-            if not moves:
-                print("⚠️ 无合法落子点，游戏结束。")
+    try:
+        while True:
+            # 检查胜负
+            checker = AI(board, my_color=WHITE)
+            winner = checker.check_winner()
+            if winner != 0:
+                print("\n" + "="*50)
+                print(f"🎉 {'黑方' if winner == 1 else '白方（AI）'} 获胜！总步数: {move_count}")
+                print("="*50)
                 break
 
-            best_move = None
-            best_score = -float('inf')
-            alpha = -float('inf')
-            beta = float('inf')
-            SEARCH_DEPTH = 2
+            if np.all(board != EMPTY):
+                print("\n🤝 平局！棋盘已满。")
+                break
 
-            for r, c in moves:
-                board[r, c] = ai_color
-                score = brain.minimax(SEARCH_DEPTH - 1, alpha, beta, False)
-                board[r, c] = 0
+            is_black_turn = (move_count % 2 == 0)
 
-                if score > best_score:
-                    best_score = score
-                    best_move = (r, c)
-                alpha = max(alpha, score)
-
-            if best_move:
-                r, c = best_move
-                board[r, c] = ai_color
-                print(f"白方（AI）落子：({r}, {c})")
+            if is_black_turn:
+                move = get_black_move(board)
+                if move:
+                    r, c = move
+                    board[r, c] = BLACK
+                    print(f"[黑方落子] ({r}, {c})")
+                else:
+                    print("黑方无合法落子")
+                    break
             else:
-                # fallback
-                r, c = moves[0]
-                board[r, c] = ai_color
-                print(f"白方（AI）随机落子：({r}, {c})")
+                move = get_white_move(board)
+                if move:
+                    r, c = move
+                    print(f"=============================")
+                    print(f"!!! AI 建议坐标: 行 {r}, 列 {c} !!!")
+                    print(f"=============================")
+                    board[r, c] = WHITE
+                else:
+                    print("白方 AI 无法决策")
+                    break
 
-        # 打印简易棋盘（只显示最近几步，避免刷屏）
-        print(f"当前步数: {move_count + 1}")
-        move_count += 1
+            # 更新虚拟棋盘显示
+            virtual_img = create_virtual_board_image(board)
+            cv2.imshow("Virtual Board", virtual_img)
+            cv2.waitKey(1)  # 必须调用才能刷新
 
-    # 最终打印小范围棋盘（可选）
-    print("\n--- 最终棋盘（中心 7x7）---")
-    center = BOARD_SIZE // 2
-    half = 3
-    sub = board[center-half:center+half+1, center-half:center+half+1]
-    for row in sub:
-        print(' '.join('.' if x == 0 else ('●' if x == 1 else '○') for x in row))
+            move_count += 1
+            time.sleep(2.5)  # 👈 关键：加长间隔，避免卡顿刷屏
+
+        # 游戏结束后再显示几秒
+        time.sleep(3)
+        cv2.destroyAllWindows()
+
+    except KeyboardInterrupt:
+        cv2.destroyAllWindows()
+        print("\n用户中断")
 
 if __name__ == "__main__":
-    simulate_game()
+    simulate_auto()
