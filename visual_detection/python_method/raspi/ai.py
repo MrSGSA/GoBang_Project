@@ -149,7 +149,7 @@ class AI:
 
         for r in range(size):
             for c in range(size):
-                if board[r, c] == EMPTY:
+                if board[r, c] == 0:
                     continue
                 color = board[r, c]
                 for dr, dc in directions:
