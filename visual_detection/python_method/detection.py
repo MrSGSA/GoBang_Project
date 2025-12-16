@@ -5,12 +5,6 @@ import threading
 import copy
 import os
 
-try:
-    from picamera2 import Picamera2
-except ImportError:
-    print("Picamera2 not found.")
-    Picamera2 = None
-
 # =================参数设置=================
 HOUGH_PARAM2 = 20       
 MIN_RADIUS = 12         
@@ -20,6 +14,10 @@ BOARD_SIZE = 19
 EMPTY, BLACK, WHITE = 0, 1, 2
 STATE_SEARCHING = 0
 STATE_LOCKED = 1
+
+# 电脑端使用的分辨率 (大多数USB摄像头支持此分辨率)
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
 
 class GobangVision:
     def __init__(self, camera_id=0, rotate_image=0):
@@ -36,7 +34,9 @@ class GobangVision:
         self.calib_dist = None
         self.new_cam_mtx = None
         self.has_calib = False
-        self._load_calibration((1640, 1232))
+        
+        # 加载校准文件，注意尺寸改为 USB 摄像头的尺寸
+        self._load_calibration((CAM_WIDTH, CAM_HEIGHT))
         
         self.last_xs = np.zeros(BOARD_SIZE, dtype=float)
         self.last_ys = np.zeros(BOARD_SIZE, dtype=float)
@@ -46,17 +46,15 @@ class GobangVision:
         self.stable_counter = 0    
         self.M_locked = None       
         
-        # 【新增】用于存储 AI 建议的坐标 (row, col)
+        # 用于存储 AI 建议的坐标 (row, col)
         self.ai_point = None 
-        
-        self.picam2 = None
 
     def start(self):
         if self.running: return
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        print(f"[Vision] Started. Rotation: {self.rotate_image}")
+        print(f"[Vision] Started on PC/USB. Rotation: {self.rotate_image}")
 
     def stop(self):
         self.running = False
@@ -65,34 +63,33 @@ class GobangVision:
     def get_current_board(self):
         with self.lock: return copy.deepcopy(self.board_data)
     
-    # 【新增】设置 AI 提示坐标
     def set_ai_hint(self, move):
         """ move: (row, col) """
         self.ai_point = move
 
     def _loop(self):
-        if Picamera2:
-            self.picam2 = Picamera2()
-            config = self.picam2.create_video_configuration(main={"size": (1640, 1232), "format": "RGB888"})
-            self.picam2.configure(config)
-            self.picam2.start()
-        else:
-            cap = cv2.VideoCapture(self.camera_id)
-            cap.set(3, 1280)
-            cap.set(4, 720)
+        # === 修改：纯 USB 摄像头初始化 ===
+        cap = cv2.VideoCapture(self.camera_id)
+        # 尝试设置高分辨率，如果摄像头不支持会自动降级
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
         
+        # 检查摄像头是否成功打开
+        if not cap.isOpened():
+            print(f"Error: Could not open camera {self.camera_id}")
+            self.running = False
+            return
+
         WARP_S = 800
         dst_pts = np.float32([[15, 15], [WARP_S-15, 15], [WARP_S-15, WARP_S-15], [15, WARP_S-15]])
         state = STATE_SEARCHING
         
         while self.running:
-            if Picamera2:
-                frame_rgb = self.picam2.capture_array()
-                if frame_rgb is None: continue
-                raw_frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            else:
-                ret, raw_frame = cap.read()
-                if not ret: time.sleep(0.01); continue
+            # === 修改：纯 OpenCV 读取 ===
+            ret, raw_frame = cap.read()
+            if not ret: 
+                time.sleep(0.01)
+                continue
             
             # 畸变矫正
             if self.has_calib:
@@ -101,7 +98,7 @@ class GobangVision:
             else:
                 frame = raw_frame
 
-            # 旋转
+            # 旋转处理
             if self.rotate_image == 1: frame = cv2.rotate(frame, cv2.ROTATE_180)
             elif self.rotate_image == 2: frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             elif self.rotate_image == 3: frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -139,6 +136,7 @@ class GobangVision:
                 self._draw_overlay_ar(debug_view, xs, ys, self.M_locked)
                 virtual_board = self._create_virtual_board_image()
 
+            # 显示窗口
             display_main = cv2.resize(debug_view, (960, 720)) 
             cv2.imshow("Main View", display_main)
             if warped_view is not None: cv2.imshow("Analysis", cv2.resize(warped_view, (400, 400)))
@@ -148,8 +146,7 @@ class GobangVision:
             if key & 0xFF == ord('q'): self.running = False
             if key & 0xFF == ord('r'): state = STATE_SEARCHING; self.stable_counter = 0; self.board_data[:] = 0; self.vote_matrix[:] = 0; self.ai_point = None
 
-        if self.picam2: self.picam2.stop()
-        elif 'cap' in locals(): cap.release()
+        cap.release()
         cv2.destroyAllWindows()
 
     def _draw_overlay_ar(self, img, xs, ys, M):
@@ -170,28 +167,19 @@ class GobangVision:
             dst = cv2.perspectiveTransform(np.array([pts_w], dtype='float32'), inv_M)[0]
             for pt in dst: cv2.circle(img, (int(pt[0]), int(pt[1])), 12, (255, 0, 0), -1)
             
-        # 【新增】2. 绘制 AI 提示点 (紫色实心圆 + 绿色外框)
+        # 2. 绘制 AI 提示点
         if self.ai_point is not None:
             ar, ac = self.ai_point
-            # 确保坐标在范围内
             if 0 <= ar < BOARD_SIZE and 0 <= ac < BOARD_SIZE:
-                # 注意：xs存的是列(x)，ys存的是行(y)
-                # Numpy坐标是 (row, col) -> (y, x)
                 target_x = xs[ac]
                 target_y = ys[ar]
-                
-                # 逆透视变换回原图
                 src_pt = np.array([[[target_x, target_y]]], dtype='float32')
                 dst_pt = cv2.perspectiveTransform(src_pt, inv_M)[0][0]
-                
                 cx, cy = int(dst_pt[0]), int(dst_pt[1])
-                # 画紫色点 (BGR: 255, 0, 255)
                 cv2.circle(img, (cx, cy), 15, (255, 0, 255), -1)
                 cv2.circle(img, (cx, cy), 20, (0, 255, 0), 2)
                 cv2.putText(img, "AI", (cx-10, cy-25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
 
-    # ... (其他辅助函数保持不变，如 _check_similarity, _create_virtual_board_image, _scan_pieces_hough, _find_grid_morphology, _snap_to_peaks, _update_votes, _draw_analysis_view, _find_board_robust, _load_calibration, _sort_pts) ...
-    # 为了节省篇幅，这里省略了这些未修改的函数，请务必保留它们！
     def _check_similarity(self, pts1, pts2):
         dist = np.mean(np.linalg.norm(pts1 - pts2, axis=1))
         return dist < 10.0
@@ -322,7 +310,10 @@ class GobangVision:
                 fs.release()
                 self.new_cam_mtx, self.roi = cv2.getOptimalNewCameraMatrix(self.calib_mtx, self.calib_dist, size, 0, size)
                 self.has_calib = True
-            except: pass
+                print("Calibration loaded.")
+            except: 
+                print("Failed to load calibration.")
+                pass
 
     def _sort_pts(self, pts):
         s = pts[np.argsort(pts[:, 1])]
@@ -331,6 +322,8 @@ class GobangVision:
         return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float32)
 
 if __name__ == "__main__":
+    # 如果你的摄像头画面是反的，修改 rotate_image=0, 1, 2, 3
+    # 0: 不旋转, 1: 180度, 2: 顺时针90度, 3: 逆时针90度
     vision = GobangVision(camera_id=0, rotate_image=1)
     vision.start()
     try:
