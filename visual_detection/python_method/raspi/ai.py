@@ -135,3 +135,39 @@ class AI:
             elif ptn_dead_3_a in s or ptn_dead_3_b in s: score += SCORE_DEAD_3
             
         return score
+
+    def check_winner(self):
+        """
+        检查当前棋盘是否有五子连珠。
+        返回: 0 - 无胜者; 1 - 黑胜; 2 - 白胜
+        """
+        board = self.board
+        size = self.size
+
+        # 四个方向: 右, 下, 右下, 左下
+        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+        for r in range(size):
+            for c in range(size):
+                if board[r, c] == EMPTY:
+                    continue
+                color = board[r, c]
+                for dr, dc in directions:
+                    count = 1  # 当前点算一个
+                    # 正向检查
+                    for i in range(1, 5):
+                        nr, nc = r + dr * i, c + dc * i
+                        if 0 <= nr < size and 0 <= nc < size and board[nr, nc] == color:
+                            count += 1
+                        else:
+                            break
+                    # 反向检查（避免重复计数，但确保是“连续5”）
+                    for i in range(1, 5):
+                        nr, nc = r - dr * i, c - dc * i
+                        if 0 <= nr < size and 0 <= nc < size and board[nr, nc] == color:
+                            count += 1
+                        else:
+                            break
+                    if count >= 5:
+                        return color
+        return 0
